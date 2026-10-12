@@ -175,11 +175,9 @@ router.post(
     const { campaign_id, destination_key, amount, evidence } = req.body;
 
     if (!evidence || !Array.isArray(evidence) || evidence.length === 0) {
-      return res
-        .status(400)
-        .json({
-          error: 'Evidence array (receipts, invoices, or links) is required for withdrawals',
-        });
+      return res.status(400).json({
+        error: 'Evidence array (receipts, invoices, or links) is required for withdrawals',
+      });
     }
 
     const { rows: campaigns } = await db.query(

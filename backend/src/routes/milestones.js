@@ -804,11 +804,9 @@ router.post(
       [reason, req.user.userId, req.params.id]
     );
     if (!rows.length) {
-      return res
-        .status(404)
-        .json({
-          error: 'Milestone not found, not awaiting review, or being released automatically',
-        });
+      return res.status(404).json({
+        error: 'Milestone not found, not awaiting review, or being released automatically',
+      });
     }
 
     await logMilestoneEvent(null, {
