@@ -393,7 +393,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -444,7 +444,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -616,7 +616,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -1166,7 +1166,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ]
     ]
@@ -2727,7 +2727,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Voting period has not ended' from contract function 'Symbol(obj#725)'"
+                  "string": "caught panic 'Voting period has not ended' from contract function 'Symbol(obj#737)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"

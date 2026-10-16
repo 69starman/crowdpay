@@ -42,6 +42,13 @@ pub enum DataKey {
     Proposal(u32), // proposal_id
 }
 
+const DAY_IN_LEDGERS: u32 = 17_280;
+/// Campaigns run for weeks and milestones can take months to deliver, so
+/// keep this contract's entries live well beyond the 4096-ledger default.
+pub const STORAGE_TTL_LEDGERS: u32 = 180 * DAY_IN_LEDGERS;
+/// Entries are only re-extended once their remaining TTL drops this far
+/// below the target, so back-to-back calls don't pay for redundant bumps.
+const TTL_BUMP_SLACK: u32 = DAY_IN_LEDGERS;
 const PROPOSAL_VOTING_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 const MIN_TOKEN_BALANCE: i128 = 1000; // Minimum 1000 tokens to propose
 const QUORUM_THRESHOLD: i128 = 1000; // 10% of total supply (assuming 10,000 total supply)
@@ -72,6 +79,7 @@ impl FeeRegistry {
         env.storage().instance().set(&DataKey::PlatformFeeBps, &initial_platform_fee_bps);
         env.storage().instance().set(&DataKey::CreatorShareBps, &initial_creator_share_bps);
         env.storage().instance().set(&DataKey::ProposalCounter, &0u32);
+        Self::bump_instance(&env);
     }
 
     pub fn get_fee(env: Env) -> u32 {
@@ -141,6 +149,8 @@ impl FeeRegistry {
         env.storage().instance().set(&DataKey::PendingProposal, &proposal);
         env.storage().instance().set(&DataKey::ProposalCounter, &new_proposal_id);
         env.storage().persistent().set(&DataKey::Proposal(new_proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(new_proposal_id));
+        Self::bump_instance(&env);
 
         new_proposal_id
     }
@@ -183,9 +193,11 @@ impl FeeRegistry {
         token_client.transfer(&voter, &env.current_contract_address(), &vote_weight);
         let deposit_key = DataKey::LockedDeposit(proposal_id, voter.clone());
         env.storage().persistent().set(&deposit_key, &vote_weight);
+        Self::bump_persistent(&env, &deposit_key);
 
         // Record vote
         env.storage().persistent().set(&vote_key, &in_favor);
+        Self::bump_persistent(&env, &vote_key);
 
         // Update proposal vote counts
         if in_favor {
@@ -196,6 +208,8 @@ impl FeeRegistry {
 
         env.storage().instance().set(&DataKey::PendingProposal, &proposal);
         env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+        Self::bump_instance(&env);
     }
 
     pub fn reclaim_vote_deposit(env: Env, voter: Address, proposal_id: u32) {
@@ -230,6 +244,7 @@ impl FeeRegistry {
 
         token_client.transfer(&env.current_contract_address(), &voter, &locked_amount);
         env.storage().persistent().remove(&deposit_key);
+        Self::bump_instance(&env);
 
         env.events().publish(
             (Symbol::new(&env, "deposit_reclaimed"), voter),
@@ -271,6 +286,8 @@ impl FeeRegistry {
 
         env.storage().instance().set(&DataKey::PendingProposal, &proposal);
         env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::Proposal(proposal_id));
+        Self::bump_instance(&env);
     }
 
     pub fn admin_set_fee(env: Env, admin: Address, new_fee_bps: u32, new_creator_share_bps: u32) {
@@ -281,10 +298,25 @@ impl FeeRegistry {
 
         env.storage().instance().set(&DataKey::PlatformFeeBps, &new_fee_bps);
         env.storage().instance().set(&DataKey::CreatorShareBps, &new_creator_share_bps);
+        Self::bump_instance(&env);
     }
 
     pub fn get_vote_status(env: Env, proposal_id: u32, voter: Address) -> Option<bool> {
         let vote_key = DataKey::ProposalVotes(proposal_id, voter);
         env.storage().persistent().get(&vote_key)
+    }
+
+    fn bump_instance(env: &Env) {
+        let extend_to = STORAGE_TTL_LEDGERS.min(env.storage().max_ttl());
+        env.storage()
+            .instance()
+            .extend_ttl(extend_to.saturating_sub(TTL_BUMP_SLACK), extend_to);
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        let extend_to = STORAGE_TTL_LEDGERS.min(env.storage().max_ttl());
+        env.storage()
+            .persistent()
+            .extend_ttl(key, extend_to.saturating_sub(TTL_BUMP_SLACK), extend_to);
     }
 }

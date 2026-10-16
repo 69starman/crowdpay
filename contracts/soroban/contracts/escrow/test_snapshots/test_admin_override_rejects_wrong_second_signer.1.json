@@ -465,7 +465,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ],
       [
@@ -639,7 +639,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ],
       [
@@ -991,7 +991,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ]
     ]
@@ -1690,7 +1690,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Invalid second signer' from contract function 'Symbol(obj#515)'"
+                  "string": "caught panic 'Invalid second signer' from contract function 'Symbol(obj#523)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"

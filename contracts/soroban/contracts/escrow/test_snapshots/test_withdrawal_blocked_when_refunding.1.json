@@ -416,7 +416,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1036820
         ]
       ],
       [
@@ -557,6 +557,36 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "RefundBase"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 500
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "RefundPool"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 500
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Target"
                             }
                           ]
@@ -590,7 +620,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1036820
         ]
       ],
       [
@@ -942,7 +972,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1036820
         ]
       ]
     ]
@@ -1581,6 +1611,58 @@
                 "bytes": "d63a954726751a876d37290072af1ee723d7d761eec3bf4191849d2116acdc73"
               },
               {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "d63a954726751a876d37290072af1ee723d7d761eec3bf4191849d2116acdc73",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 500
+              }
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000006",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "d63a954726751a876d37290072af1ee723d7d761eec3bf4191849d2116acdc73"
+              },
+              {
                 "symbol": "transfer"
               }
             ],
@@ -1803,7 +1885,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Campaign has failed or is refunding; withdrawals blocked' from contract function 'Symbol(obj#641)'"
+                  "string": "caught panic 'Campaign has failed or is refunding; withdrawals blocked' from contract function 'Symbol(obj#705)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
@@ -1967,7 +2049,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Campaign has failed or is refunding; withdrawals blocked' from contract function 'Symbol(obj#705)'"
+                  "string": "caught panic 'Campaign has failed or is refunding; withdrawals blocked' from contract function 'Symbol(obj#777)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
