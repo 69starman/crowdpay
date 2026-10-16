@@ -8,6 +8,16 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Sym
 /// campaign's funds to the platform. Any fee above this cap is rejected outright.
 pub const MAX_FEE_BPS: u32 = 1000;
 
+/// Ledgers close roughly every 5 seconds on Stellar.
+const LEDGER_SECONDS: u64 = 5;
+const DAY_IN_LEDGERS: u32 = 17_280;
+/// How long contributor balances must stay live after the deadline so that
+/// refunds still work without someone first restoring archived entries.
+pub const REFUND_WINDOW_LEDGERS: u32 = 60 * DAY_IN_LEDGERS;
+/// Entries are only re-extended once their remaining TTL drops this far
+/// below the target, so back-to-back calls don't pay for redundant bumps.
+const TTL_BUMP_SLACK: u32 = DAY_IN_LEDGERS;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -28,6 +38,8 @@ pub enum DataKey {
     IsRefunding,
     CampaignFailed,
     SecondSigner,
+    RefundPool,
+    RefundBase,
 }
 
 #[contract]
@@ -66,6 +78,7 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::IsInitialized, &true);
         env.storage().instance().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
         env.storage().instance().set(&DataKey::PlatformFeeRecipient, &platform_fee_recipient);
+        Self::bump_instance(&env);
     }
 
     pub fn set_milestones_contract(env: Env, milestones: Address) {
@@ -95,6 +108,7 @@ impl EscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::CampaignFailed, &true);
+        Self::bump_instance(&env);
         env.events().publish((Symbol::new(&env, "campaign_failed"), admin), ());
     }
 
@@ -132,9 +146,11 @@ impl EscrowContract {
         let balance_key = DataKey::Balances(from.clone());
         let current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         env.storage().persistent().set(&balance_key, &(current_balance + amount));
+        Self::bump_persistent(&env, &balance_key);
 
         let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalRaised, &(total_raised + amount));
+        Self::bump_instance(&env);
 
         env.events().publish(
             (Symbol::new(&env, "deposit"), from),
@@ -169,6 +185,8 @@ impl EscrowContract {
         let dest_key = DataKey::ApprovedWithdrawalFor(to.clone());
         let approved_for_to: i128 = env.storage().persistent().get(&dest_key).unwrap_or(0);
         env.storage().persistent().set(&dest_key, &(approved_for_to + release_amount));
+        Self::bump_persistent(&env, &dest_key);
+        Self::bump_instance(&env);
 
         let approved: i128 = env.storage().instance().get(&DataKey::ApprovedWithdrawal).unwrap_or(0);
         env.storage().instance().set(&DataKey::ApprovedWithdrawal, &(approved + release_amount));
@@ -195,6 +213,8 @@ impl EscrowContract {
         let dest_key = DataKey::ApprovedWithdrawalFor(to.clone());
         let approved_for_to: i128 = env.storage().persistent().get(&dest_key).unwrap_or(0);
         env.storage().persistent().set(&dest_key, &(approved_for_to + release_amount));
+        Self::bump_persistent(&env, &dest_key);
+        Self::bump_instance(&env);
 
         let approved: i128 = env.storage().instance().get(&DataKey::ApprovedWithdrawal).unwrap_or(0);
         env.storage().instance().set(&DataKey::ApprovedWithdrawal, &(approved + release_amount));
@@ -308,6 +328,8 @@ impl EscrowContract {
 
         approved_for_to -= release_amount;
         env.storage().persistent().set(&dest_key, &approved_for_to);
+        Self::bump_persistent(&env, &dest_key);
+        Self::bump_instance(&env);
 
         approved -= release_amount;
         env.storage().instance().set(&DataKey::ApprovedWithdrawal, &approved);
@@ -369,17 +391,28 @@ impl EscrowContract {
         );
     }
 
+    /// Refunds a contributor once the campaign has failed.
+    ///
+    /// Withdrawals (milestone releases, admin overrides) may already have
+    /// moved money out before the campaign failed, so the contract can hold
+    /// less than the sum of recorded balances. On the first refund we snapshot
+    /// the funds still held (`RefundPool`) and the total contributed
+    /// (`RefundBase`); every contributor then receives
+    /// `balance * RefundPool / RefundBase`, so refund order no longer matters.
     pub fn refund(env: Env, contributor: Address) {
-        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
-        if env.ledger().timestamp() < deadline {
-            panic!("Deadline has not passed");
-        }
+        let explicitly_failed: bool = env.storage().instance().get(&DataKey::CampaignFailed).unwrap_or(false);
+        if !explicitly_failed {
+            let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
+            if env.ledger().timestamp() < deadline {
+                panic!("Deadline has not passed");
+            }
 
-        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
-        let target: i128 = env.storage().instance().get(&DataKey::Target).unwrap();
+            let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+            let target: i128 = env.storage().instance().get(&DataKey::Target).unwrap();
 
-        if total_raised >= target {
-            panic!("Campaign succeeded, refunds unavailable");
+            if total_raised >= target {
+                panic!("Campaign succeeded, refunds unavailable");
+            }
         }
 
         let balance_key = DataKey::Balances(contributor.clone());
@@ -388,22 +421,38 @@ impl EscrowContract {
             panic!("No contribution to refund");
         }
 
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let client = token::Client::new(&env, &asset);
+
+        if !env.storage().instance().has(&DataKey::RefundBase) {
+            let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+            let held = client.balance(&env.current_contract_address());
+            let pool = if held < total_raised { held } else { total_raised };
+            env.storage().instance().set(&DataKey::RefundPool, &pool);
+            env.storage().instance().set(&DataKey::RefundBase, &total_raised);
+        }
+        let pool: i128 = env.storage().instance().get(&DataKey::RefundPool).unwrap();
+        let base: i128 = env.storage().instance().get(&DataKey::RefundBase).unwrap();
+        let payout = amount * pool / base;
+
         // Mark campaign as refunding so any withdrawals are permanently blocked
         env.storage().instance().set(&DataKey::IsRefunding, &true);
 
-        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
-        let client = token::Client::new(&env, &asset);
-        client.transfer(&env.current_contract_address(), &contributor, &amount);
-
         env.storage().persistent().set(&balance_key, &0i128);
+        Self::bump_persistent(&env, &balance_key);
 
         let total_raised_current: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
         let new_total = total_raised_current - amount;
         env.storage().instance().set(&DataKey::TotalRaised, &new_total);
+        Self::bump_instance(&env);
+
+        if payout > 0 {
+            client.transfer(&env.current_contract_address(), &contributor, &payout);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "refund"), contributor),
-            amount,
+            payout,
         );
     }
 
@@ -424,5 +473,35 @@ impl EscrowContract {
     pub fn get_approved_withdrawal(env: Env, to: Address) -> i128 {
         let dest_key = DataKey::ApprovedWithdrawalFor(to);
         env.storage().persistent().get(&dest_key).unwrap_or(0)
+    }
+
+    pub fn get_balance(env: Env, contributor: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::Balances(contributor)).unwrap_or(0)
+    }
+
+    /// TTL (in ledgers) that keeps an entry live until the deadline plus the
+    /// refund window, capped at the network's maximum entry TTL.
+    fn ttl_target(env: &Env) -> u32 {
+        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let to_deadline = deadline.saturating_sub(now) / LEDGER_SECONDS;
+        let to_deadline = if to_deadline > u32::MAX as u64 { u32::MAX } else { to_deadline as u32 };
+        to_deadline
+            .saturating_add(REFUND_WINDOW_LEDGERS)
+            .min(env.storage().max_ttl())
+    }
+
+    fn bump_instance(env: &Env) {
+        let extend_to = Self::ttl_target(env);
+        env.storage()
+            .instance()
+            .extend_ttl(extend_to.saturating_sub(TTL_BUMP_SLACK), extend_to);
+    }
+
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        let extend_to = Self::ttl_target(env);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, extend_to.saturating_sub(TTL_BUMP_SLACK), extend_to);
     }
 }

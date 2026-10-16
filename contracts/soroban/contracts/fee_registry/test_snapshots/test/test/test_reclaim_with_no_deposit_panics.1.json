@@ -284,7 +284,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -456,7 +456,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -761,7 +761,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ]
     ]
@@ -1242,7 +1242,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'No deposit to reclaim' from contract function 'Symbol(obj#339)'"
+                  "string": "caught panic 'No deposit to reclaim' from contract function 'Symbol(obj#343)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"

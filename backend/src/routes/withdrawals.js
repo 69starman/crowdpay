@@ -28,6 +28,10 @@ const {
 } = require('../services/emailService');
 const { emitWebhookEventForUser, WEBHOOK_EVENTS } = require('../services/webhookDispatcher');
 const { withDecryptedWalletSecret } = require('../services/walletSecrets');
+const {
+  assertCustodialWithdrawalAllowed,
+  CustodialSigningLimitError,
+} = require('../services/custodialSigningPolicy');
 const { createNotification } = require('../services/notifications');
 const { notifyContributorFundRelease } = require('../services/fundReleaseNotifications');
 const { calculateCommissions, settleCommissions } = require('../services/referral');
@@ -419,6 +423,13 @@ router.post(
 
         signedXdr = signed_xdr;
       } else {
+        // Custodial key: the server would hold both multisig signatures, so
+        // only sign up to the custodial limit (refunds to contributors exempt).
+        assertCustodialWithdrawalAllowed({
+          walletType: userRow.wallet_type,
+          amount: requestRow.amount,
+          isRefund: !!requestRow.is_refund,
+        });
         signedXdr = await withDecryptedWalletSecret(
           userRow.wallet_secret_encrypted,
           {
@@ -433,6 +444,11 @@ router.post(
         );
       }
     } catch (err) {
+      if (err instanceof CustodialSigningLimitError) {
+        return res
+          .status(err.statusCode)
+          .json({ error: err.message, code: err.code, limit: err.limit });
+      }
       logger.error('Creator withdrawal signing failed', {
         withdrawal_id: req.params.id,
         error: err.message,

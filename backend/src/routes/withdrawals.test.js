@@ -445,6 +445,7 @@ test('POST /api/withdrawals/:id/approve/creator signs withdrawal request', async
               creator_signed: false,
               platform_signed: false,
               unsigned_xdr: 'xdr-base',
+              amount: '100.0000000',
               creator_id: 'creator-1',
               campaign_id: '11111111-1111-1111-1111-111111111111',
               campaign_status: 'active',
@@ -472,6 +473,58 @@ test('POST /api/withdrawals/:id/approve/creator signs withdrawal request', async
   assert.equal(response.status, 200);
   assert.equal(response.body.creator_signed, true);
   assert.ok(calls.some(c => c.includes('creator_signed')));
+});
+
+test('POST /api/withdrawals/:id/approve/creator refuses a custodial signature above the limit', async () => {
+  const previous = process.env.CUSTODIAL_WITHDRAWAL_LIMIT;
+  process.env.CUSTODIAL_WITHDRAWAL_LIMIT = '50';
+  const calls = [];
+  const { app, cleanup } = buildApp({
+    queryImpl: async text => {
+      calls.push(text);
+      if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+      if (text.includes('SELECT creator_id FROM campaigns WHERE id')) {
+        return { rows: [{ creator_id: 'creator-1' }] };
+      }
+      if (text.includes('FROM withdrawal_requests wr')) {
+        return {
+          rows: [
+            {
+              id: 'w-1',
+              status: 'pending',
+              creator_signed: false,
+              platform_signed: false,
+              unsigned_xdr: 'xdr-base',
+              amount: '100.0000000',
+              creator_id: 'creator-1',
+              campaign_id: '11111111-1111-1111-1111-111111111111',
+              campaign_status: 'active',
+            },
+          ],
+        };
+      }
+      if (text.includes('wallet_secret_encrypted') && text.includes('FROM users')) {
+        return { rows: [{ wallet_secret_encrypted: 'SCREATOR', wallet_public_key: 'GCREATOR' }] };
+      }
+      if (text.includes('UPDATE withdrawal_requests') && text.includes('creator_signed = TRUE')) {
+        return { rows: [{ id: 'w-1', creator_signed: true, unsigned_xdr: 'xdr-signed' }] };
+      }
+      if (text.includes('INSERT INTO withdrawal_approval_events')) return { rows: [] };
+      return { rows: [] };
+    },
+  });
+
+  const response = await request(app)
+    .post('/api/withdrawals/w-1/approve/creator')
+    .set('Authorization', 'Bearer token')
+    .send({});
+
+  cleanup();
+  if (previous === undefined) delete process.env.CUSTODIAL_WITHDRAWAL_LIMIT;
+  else process.env.CUSTODIAL_WITHDRAWAL_LIMIT = previous;
+  assert.equal(response.status, 403);
+  assert.equal(response.body.code, 'NON_CUSTODIAL_SIGNATURE_REQUIRED');
+  assert.ok(!calls.some(c => c.includes('UPDATE withdrawal_requests')));
 });
 
 test('POST /api/withdrawals/:id/approve/platform denies insufficient signatures', async () => {

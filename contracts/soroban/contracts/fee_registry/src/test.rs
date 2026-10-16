@@ -221,4 +221,49 @@ mod test {
 
         client.reclaim_vote_deposit(&non_voter, &proposal_id);
     }
+
+    #[test]
+    fn test_vote_deposit_survives_past_default_ttl() {
+        use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+        use soroban_sdk::testutils::Ledger;
+        use soroban_sdk::token;
+        use crate::{DataKey, STORAGE_TTL_LEDGERS};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup_contract(&env);
+        let admin = Address::generate(&env);
+        let token_addr = env.register_stellar_asset_contract(Address::generate(&env));
+        let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+        let token_client = token::Client::new(&env, &token_addr);
+        client.initialize(&admin, &token_addr, &250, &500);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        token_admin_client.mint(&proposer, &2000);
+        token_admin_client.mint(&voter, &1000);
+        let proposal_id = client.propose_change(&proposer, &300, &600);
+        client.vote(&voter, &proposal_id, &true);
+
+        env.as_contract(&contract_id, || {
+            let deposit_key = DataKey::LockedDeposit(proposal_id, voter.clone());
+            assert!(env.storage().persistent().get_ttl(&deposit_key) >= STORAGE_TTL_LEDGERS - 1);
+            assert!(env.storage().persistent().get_ttl(&DataKey::Proposal(proposal_id)) >= STORAGE_TTL_LEDGERS - 1);
+            assert!(env.storage().instance().get_ttl() >= STORAGE_TTL_LEDGERS - 1);
+        });
+
+        // Keep the test token alive; only the registry's own storage is under test.
+        let jump = env.ledger().get().min_persistent_entry_ttl * 100;
+        env.as_contract(&token_addr, || {
+            env.storage().instance().extend_ttl(jump + 1000, jump + 1000);
+        });
+        env.ledger().with_mut(|li| {
+            li.sequence_number += jump;
+            li.timestamp += 7 * 24 * 60 * 60 + 1;
+        });
+
+        client.execute_proposal(&proposal_id);
+        client.reclaim_vote_deposit(&voter, &proposal_id);
+        assert_eq!(token_client.balance(&voter), 1000);
+    }
 }

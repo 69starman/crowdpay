@@ -413,7 +413,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ],
       [
@@ -575,7 +575,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ],
       [
@@ -927,7 +927,7 @@
             },
             "ext": "v0"
           },
-          4095
+          1236799
         ]
       ]
     ]
@@ -1576,7 +1576,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Insufficient approved amount for destination' from contract function 'Symbol(obj#445)'"
+                  "string": "caught panic 'Insufficient approved amount for destination' from contract function 'Symbol(obj#453)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
