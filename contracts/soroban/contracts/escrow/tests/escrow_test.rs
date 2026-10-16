@@ -267,14 +267,19 @@ fn test_deposit_multiple_contributors() {
 #[test]
 fn test_approve_withdrawal_increases_approved() {
     let env = Env::default();
-    let (contract_id, admin, _, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
+    let (contract_id, admin, contributor, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
     let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
 
     client.approve_withdrawal(&admin, &500);
 
     assert_eq!(client.get_approved_withdrawal(&admin), 500);
     let total_raised: i128 = client.get_total_raised();
-    assert_eq!(total_raised, 0);
+    assert_eq!(total_raised, 1000);
 }
 
 #[test]
@@ -324,8 +329,13 @@ fn test_execute_withdrawal_no_fee() {
 #[test]
 fn test_execute_withdrawal_rejects_insufficient_approval() {
     let env = Env::default();
-    let (contract_id, admin, _, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
+    let (contract_id, admin, contributor, _fee_recipient) = setup_contract(&env, 1000, 999999, 0);
     let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.execute_withdrawal(&admin, &500);
@@ -491,7 +501,7 @@ fn test_refund_rejects_no_contribution() {
 fn test_full_flow_deposit_withdraw_with_fee() {
     let env = Env::default();
     let (contract_id, admin, contributor, fee_recipient) =
-        setup_contract(&env, 2000, 999999, 500);
+        setup_contract(&env, 1000, 999999, 500);
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let token_addr = client.get_asset();
@@ -514,4 +524,191 @@ fn test_full_flow_deposit_withdraw_with_fee() {
 
     let remaining = 200i128;
     assert_eq!(token_client.balance(&contract_id), remaining);
+}
+
+#[test]
+fn test_withdrawal_blocked_when_target_not_met() {
+    let env = Env::default();
+    // Target is 2000, only 1000 deposited
+    let (contract_id, admin, contributor, _fee_recipient) =
+        setup_contract(&env, 2000, 999999, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_withdrawal(&admin, &500);
+    }));
+    assert!(result.is_err());
+    assert_eq!(client.get_approved_withdrawal(&admin), 0);
+}
+
+#[test]
+fn test_withdrawal_allowed_from_milestones_contract_before_target() {
+    let env = Env::default();
+    let milestones_admin = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    env.mock_all_auths();
+
+    let (token_addr, _) = install_token(&env);
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    // Milestones contract is admin of Escrow
+    client.initialize(
+        &milestones_admin,
+        &1u64,
+        &2000, // target is 2000
+        &999999,
+        &token_addr,
+        &0,
+        &fee_recipient,
+    );
+    client.set_milestones_contract(&milestones_admin);
+
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    // Even though target 2000 is not met, milestones admin can approve milestone release
+    client.approve_withdrawal(&milestones_admin, &300);
+    assert_eq!(client.get_approved_withdrawal(&milestones_admin), 300);
+
+    client.execute_withdrawal(&milestones_admin, &300);
+    let token_client = token::Client::new(&env, &token_addr);
+    assert_eq!(token_client.balance(&milestones_admin), 300);
+}
+
+#[test]
+fn test_withdrawal_blocked_after_campaign_failed() {
+    let env = Env::default();
+    let (contract_id, admin, contributor, _fee_recipient) =
+        setup_contract(&env, 1000, 100, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &500);
+    client.deposit(&contributor, &500);
+
+    // Fast-forward past deadline while under target -> campaign failed
+    env.ledger().set_timestamp(200);
+    assert_eq!(client.is_campaign_failed(), true);
+
+    let approve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_withdrawal(&admin, &500);
+    }));
+    assert!(approve_result.is_err());
+
+    let execute_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_withdrawal(&admin, &500);
+    }));
+    assert!(execute_result.is_err());
+}
+
+#[test]
+fn test_withdrawal_blocked_when_refunding() {
+    let env = Env::default();
+    let (contract_id, admin, contributor, _fee_recipient) =
+        setup_contract(&env, 1000, 100, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &500);
+    client.deposit(&contributor, &500);
+
+    env.ledger().set_timestamp(200);
+
+    // Contributor claims refund
+    client.refund(&contributor);
+    assert_eq!(client.is_refunding(), true);
+
+    // Any withdrawal approval or execution is now blocked
+    let approve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_withdrawal(&admin, &100);
+    }));
+    assert!(approve_result.is_err());
+
+    let execute_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_withdrawal(&admin, &100);
+    }));
+    assert!(execute_result.is_err());
+}
+
+#[test]
+fn test_admin_override_withdrawal_with_second_signer() {
+    let env = Env::default();
+    let (contract_id, _admin, contributor, fee_recipient) =
+        setup_contract(&env, 2000, 999999, 100);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let second_signer = Address::generate(&env);
+    client.set_second_signer(&second_signer);
+    assert_eq!(client.get_second_signer(), Some(second_signer.clone()));
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    let payout_destination = Address::generate(&env);
+
+    // Admin override withdrawal executes with both signers and emits event
+    client.admin_override_withdrawal(&second_signer, &payout_destination, &500);
+
+    let token_client = token::Client::new(&env, &token_addr);
+    let fee = (500 * 100) / 10000;
+    let net = 500 - fee;
+    assert_eq!(token_client.balance(&payout_destination), net);
+    assert_eq!(token_client.balance(&fee_recipient), fee);
+}
+
+#[test]
+fn test_admin_override_rejects_same_signer() {
+    let env = Env::default();
+    let (contract_id, admin, contributor, _fee_recipient) =
+        setup_contract(&env, 2000, 999999, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    let payout_destination = Address::generate(&env);
+
+    // Using admin as second signer panics
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.admin_override_withdrawal(&admin, &payout_destination, &500);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_admin_override_rejects_wrong_second_signer() {
+    let env = Env::default();
+    let (contract_id, _admin, contributor, _fee_recipient) =
+        setup_contract(&env, 2000, 999999, 0);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let expected_second_signer = Address::generate(&env);
+    let wrong_second_signer = Address::generate(&env);
+    client.set_second_signer(&expected_second_signer);
+
+    let token_addr = client.get_asset();
+    let token_cl = token::StellarAssetClient::new(&env, &token_addr);
+    token_cl.mint(&contributor, &1000);
+    client.deposit(&contributor, &1000);
+
+    let payout_destination = Address::generate(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.admin_override_withdrawal(&wrong_second_signer, &payout_destination, &500);
+    }));
+    assert!(result.is_err());
 }

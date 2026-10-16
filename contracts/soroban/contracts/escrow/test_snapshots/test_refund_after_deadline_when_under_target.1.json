@@ -521,6 +521,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "IsRefunding"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": true
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PlatformFeeBps"
                             }
                           ]
