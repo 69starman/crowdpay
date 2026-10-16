@@ -299,7 +299,10 @@ Feature flags use pluggable adapters. In addition to the default `env` adapter, 
 
 ## Part of Savitura
 
-- **[Fluxa](https://github.com/Savitura/Fluxa)** — the payment infrastructure layer
+CrowdPay operates as a fully self-contained crowdfunding platform with native Stellar/Soroban payments, escrow, and anchor integrations.
+
+Within the broader Savitura ecosystem:
+- **[Fluxa](https://github.com/Savitura/Fluxa)** — a separate, standalone payment infrastructure product under development, planned as a modular integration in future iterations (see [Architecture Decision](docs/architecture-decision-fluxa.md))
 - **[SaviTools](https://github.com/Savitura/SaviTools)** — developer tools for Stellar builders
 
 ---

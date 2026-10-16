@@ -1765,7 +1765,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Insufficient approved amount for destination' from contract function 'Symbol(obj#501)'"
+                  "string": "caught panic 'Insufficient approved amount for destination' from contract function 'Symbol(obj#543)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"

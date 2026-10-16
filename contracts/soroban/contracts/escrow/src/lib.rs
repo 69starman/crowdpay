@@ -24,6 +24,10 @@ pub enum DataKey {
     PlatformFeeBps,
     PlatformFeeRecipient,
     PendingFeeBps,
+    MilestonesContract,
+    IsRefunding,
+    CampaignFailed,
+    SecondSigner,
 }
 
 #[contract]
@@ -64,8 +68,56 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::PlatformFeeRecipient, &platform_fee_recipient);
     }
 
+    pub fn set_milestones_contract(env: Env, milestones: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MilestonesContract, &milestones);
+    }
+
+    pub fn get_milestones_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::MilestonesContract)
+    }
+
+    pub fn set_second_signer(env: Env, second_signer: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if second_signer == admin {
+            panic!("Second signer must be distinct from admin");
+        }
+        env.storage().instance().set(&DataKey::SecondSigner, &second_signer);
+    }
+
+    pub fn get_second_signer(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SecondSigner)
+    }
+
+    pub fn mark_campaign_failed(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::CampaignFailed, &true);
+        env.events().publish((Symbol::new(&env, "campaign_failed"), admin), ());
+    }
+
+    pub fn is_campaign_failed(env: Env) -> bool {
+        if env.storage().instance().get(&DataKey::CampaignFailed).unwrap_or(false) {
+            return true;
+        }
+        let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
+        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+        let target: i128 = env.storage().instance().get(&DataKey::Target).unwrap();
+        env.ledger().timestamp() > deadline && total_raised < target
+    }
+
+    pub fn is_refunding(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::IsRefunding).unwrap_or(false)
+    }
+
     pub fn deposit(env: Env, from: Address, amount: i128) {
         from.require_auth();
+
+        if Self::is_campaign_failed(env.clone()) || Self::is_refunding(env.clone()) {
+            panic!("Campaign is closed for contributions");
+        }
 
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         let current_time = env.ledger().timestamp();
@@ -94,6 +146,48 @@ impl EscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        if Self::is_campaign_failed(env.clone()) || Self::is_refunding(env.clone()) {
+            panic!("Campaign has failed or is refunding; withdrawals blocked");
+        }
+
+        let total_raised: i128 = env.storage().instance().get(&DataKey::TotalRaised).unwrap_or(0);
+        let target: i128 = env.storage().instance().get(&DataKey::Target).unwrap();
+        let milestones_opt: Option<Address> = env.storage().instance().get(&DataKey::MilestonesContract);
+        let is_from_milestones = match milestones_opt {
+            Some(ref m) => admin == *m,
+            None => false,
+        };
+
+        if total_raised < target && !is_from_milestones {
+            panic!("Withdrawal not allowed: target not met");
+        }
+
+        if release_amount <= 0 {
+            panic!("Release amount must be positive");
+        }
+
+        let dest_key = DataKey::ApprovedWithdrawalFor(to.clone());
+        let approved_for_to: i128 = env.storage().persistent().get(&dest_key).unwrap_or(0);
+        env.storage().persistent().set(&dest_key, &(approved_for_to + release_amount));
+
+        let approved: i128 = env.storage().instance().get(&DataKey::ApprovedWithdrawal).unwrap_or(0);
+        env.storage().instance().set(&DataKey::ApprovedWithdrawal, &(approved + release_amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "approve_withdrawal"), to),
+            release_amount,
+        );
+    }
+
+    pub fn approve_milestone_withdrawal(env: Env, to: Address, release_amount: i128) {
+        let milestones: Address = env.storage().instance().get(&DataKey::MilestonesContract)
+            .expect("Milestones contract not configured");
+        milestones.require_auth();
+
+        if Self::is_campaign_failed(env.clone()) || Self::is_refunding(env.clone()) {
+            panic!("Campaign has failed or is refunding; withdrawals blocked");
+        }
+
         if release_amount <= 0 {
             panic!("Release amount must be positive");
         }
@@ -112,11 +206,6 @@ impl EscrowContract {
     }
 
     /// Step 1 of 2: the admin proposes a new platform fee.
-    ///
-    /// The proposal is validated against [`MAX_FEE_BPS`] and stored as pending, but it
-    /// does **not** take effect until [`Self::confirm_fee_change`] is called in a separate
-    /// transaction. Requiring two explicit admin actions makes an accidental, fund-draining
-    /// fee change far harder to trigger by a single typo.
     pub fn propose_fee_change(env: Env, new_fee_bps: u32) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -134,9 +223,6 @@ impl EscrowContract {
     }
 
     /// Step 2 of 2: the admin confirms the pending fee, applying it.
-    ///
-    /// Panics if there is no pending proposal. The pending value is re-validated against
-    /// [`MAX_FEE_BPS`] as a defense-in-depth measure before it becomes the active fee.
     pub fn confirm_fee_change(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -185,6 +271,10 @@ impl EscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        if Self::is_campaign_failed(env.clone()) || Self::is_refunding(env.clone()) {
+            panic!("Campaign has failed or is refunding; withdrawals blocked");
+        }
+
         if release_amount <= 0 {
             panic!("Release amount must be positive");
         }
@@ -228,6 +318,57 @@ impl EscrowContract {
         );
     }
 
+    /// Admin override withdrawal requiring a second signer. Emits an event.
+    pub fn admin_override_withdrawal(
+        env: Env,
+        second_signer: Address,
+        to: Address,
+        release_amount: i128,
+    ) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        second_signer.require_auth();
+
+        if admin == second_signer {
+            panic!("Second signer must be distinct from admin");
+        }
+
+        if let Some(configured) = env.storage().instance().get::<_, Address>(&DataKey::SecondSigner) {
+            if second_signer != configured {
+                panic!("Invalid second signer");
+            }
+        }
+
+        if release_amount <= 0 {
+            panic!("Release amount must be positive");
+        }
+
+        let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
+        let client = token::Client::new(&env, &asset);
+        let contract_balance = client.balance(&env.current_contract_address());
+        if contract_balance < release_amount {
+            panic!("Insufficient contract balance for override withdrawal");
+        }
+
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::PlatformFeeBps).unwrap_or(0);
+        let fee_amount = (release_amount * (fee_bps as i128)) / 10000;
+        let net_amount = release_amount - fee_amount;
+
+        if net_amount > 0 {
+            client.transfer(&env.current_contract_address(), &to, &net_amount);
+        }
+
+        if fee_amount > 0 {
+            let fee_recipient: Address = env.storage().instance().get(&DataKey::PlatformFeeRecipient).unwrap();
+            client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_override_withdrawal"), to),
+            (release_amount, second_signer),
+        );
+    }
+
     pub fn refund(env: Env, contributor: Address) {
         let deadline: u64 = env.storage().instance().get(&DataKey::Deadline).unwrap();
         if env.ledger().timestamp() < deadline {
@@ -246,6 +387,9 @@ impl EscrowContract {
         if amount <= 0 {
             panic!("No contribution to refund");
         }
+
+        // Mark campaign as refunding so any withdrawals are permanently blocked
+        env.storage().instance().set(&DataKey::IsRefunding, &true);
 
         let asset: Address = env.storage().instance().get(&DataKey::Asset).unwrap();
         let client = token::Client::new(&env, &asset);
