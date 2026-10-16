@@ -127,6 +127,10 @@ impl EscrowContract {
     }
 
     pub fn deposit(env: Env, from: Address, amount: i128) {
+        if amount <= 0 {
+            panic!("Deposit amount must be positive");
+        }
+
         from.require_auth();
 
         if Self::is_campaign_failed(env.clone()) || Self::is_refunding(env.clone()) {
