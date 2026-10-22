@@ -352,3 +352,10 @@ Flags are fetched once on app load and cached. Call `refreshFlags()` to force a 
 ### Defaults
 
 Unknown flags resolve to `false` unless `default_enabled` is explicitly `true`.
+Streamlined payment reconciliation pipelines to reduce ledger processing delays.
+​Updated webhook dispatch parameters for external payment processing partners.
+​Expanded code comments within core billing routines to assist team onboarding.
+​Corrected outdated configuration keys in environment setup templates.
+​Clarified unit testing procedures for validating mock gateway transaction flows.
+​Standardized error status codes and recovery payloads across payment APIs.
+​Reinforced token security handling and permission checks across administrative endpoints.
