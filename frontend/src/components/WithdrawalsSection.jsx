@@ -192,19 +192,33 @@ export default function WithdrawalsSection({ campaign, milestones = [], user, to
       if (!unsignedXdr) throw new Error('Missing unsigned transaction');
 
       const network = await getNetwork();
-      if (network?.error) throw new Error('Could not read Freighter network');
+    if (network?.error) throw new Error('Could not read Freighter network');
 
-      const signed = await signTransaction(unsignedXdr, {
-        networkPassphrase: network?.networkPassphrase,
-        address: user?.wallet_public_key,
-      });
-      if (signed?.error) throw new Error(signed.error?.message || 'Freighter signing failed');
-      if (!signed?.signedTxXdr) throw new Error('Freighter did not return a signed transaction');
+    // Check if the transaction XDR is expired
+    if (unsignedXdr.timeBounds?.maxTime) {
+      const maxTime = Number(unsignedXdr.timeBounds.maxTime);
+      if (Math.floor(Date.now() / 1000) > maxTime) {
+        throw new Error('This transaction has expired. Please request a new withdrawal quote.');
+      }
+    }
 
-      await api.approveWithdrawalCreator(id, { signed_xdr: signed.signedTxXdr });
-      await refresh();
+    const signed = await signTransaction(unsignedXdr, {
+      networkPassphrase: network?.networkPassphrase,
+      address: user?.wallet_public_key,
+    });
+    if (signed?.error) throw new Error(signed.error?.message || 'Freighter signing failed');
+    if (!signed?.signedTxXdr) throw new Error('Freighter did not return a signed transaction');
+
+    await api.approveWithdrawalCreator(id, { signed_xdr: signed.signedTxXdr });
+    await refresh();
     } catch (err) {
-      setError(err.message || 'Could not sign with Freighter');
+      if (err?.message && err.message.includes('expired')) {
+        setError('This withdrawal has expired. Please request a new quote.');
+      } else if (err?.message && err.message.includes('network')) {
+        setError('Network mismatch detected. Please switch your wallet to the correct network.');
+      } else {
+        setError(err.message || 'Could not sign with Freighter');
+      }
     } finally {
       setBusyId(null);
     }
@@ -547,13 +561,20 @@ export default function WithdrawalsSection({ campaign, milestones = [], user, to
                     {row.destination_key.slice(0, 6)}…{row.destination_key.slice(-4)}
                   </code>
                 </div>
-                <div style={styles.meta}>{withdrawalsStatusLabel(row, expiredIds.has(row.id), t)}</div>
+                <div style={styles.meta}>
+                  {withdrawalsStatusLabel(row, expiredIds.has(row.id), t)}
+                </div>
                 {row.evidence && row.evidence.length > 0 && (
                   <div style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>
                     <strong>{t('withdrawals.evidenceLabel')}</strong>{' '}
                     {row.evidence.map((ev, i) => (
                       <span key={i}>
-                        <a href={ev} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>
+                        <a
+                          href={ev}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ color: 'var(--color-accent)' }}
+                        >
                           {t('withdrawals.link', { num: i + 1 })}
                         </a>
                         {i < row.evidence.length - 1 ? ', ' : ''}
@@ -641,7 +662,9 @@ export default function WithdrawalsSection({ campaign, milestones = [], user, to
                           </strong>{' '}
                           to:
                         </p>
-                        <code style={{ fontSize: '0.75rem', wordBreak: 'break-all', color: '#555' }}>
+                        <code
+                          style={{ fontSize: '0.75rem', wordBreak: 'break-all', color: '#555' }}
+                        >
                           {row.destination_key}
                         </code>
                         <p style={{ fontSize: '0.78rem', color: '#b45309', marginTop: '0.4rem' }}>
@@ -661,7 +684,7 @@ export default function WithdrawalsSection({ campaign, milestones = [], user, to
                                 runAction(
                                   row.id,
                                   () => api.approveWithdrawalCreator(row.id),
-                                  'Withdrawal signed',
+                                  'Withdrawal signed'
                                 );
                               }
                             }}
@@ -687,7 +710,9 @@ export default function WithdrawalsSection({ campaign, milestones = [], user, to
                         style={{ fontSize: '0.8rem' }}
                         onClick={() => setConfirmingSignId(row.id)}
                       >
-                        {user?.wallet_type === 'freighter' ? 'Sign in Freighter' : 'Sign as creator'}
+                        {user?.wallet_type === 'freighter'
+                          ? 'Sign in Freighter'
+                          : 'Sign as creator'}
                       </button>
                     )}
                   </>

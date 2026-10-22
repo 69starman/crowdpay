@@ -368,12 +368,20 @@ The `campaign_translations` table allows creators to provide campaign descriptio
 
 **Unique constraint:** `(campaign_id, language)` — one translation per language per campaign.
 
+Locale normalization, API behavior, and operational limits are documented in
+[`campaign-localization.md`](campaign-localization.md).
+
 ## Feature Flags (#800)
 
 The `feature_flags` table backs the runtime flag endpoints in
 `backend/src/routes/featureFlags.js`. Its canonical shape is declared both in
 the migration `backend/db/migrations/20260906_feature_flags.sql` and in
 `backend/db/schema.sql`, which now match so `migrate:fresh` converges.
+
+The convergence check compares every column's name, type, nullability and
+default, but intentionally does not compare `ordinal_position`: PostgreSQL
+cannot reorder existing columns and migration-built databases append later
+columns. See `backend/db/verify-schema-convergence.js`.
 
 | Column            | Type            | Description                               |
 |-------------------|-----------------|-------------------------------------------|

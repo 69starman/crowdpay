@@ -3,7 +3,10 @@ const db = require('../config/database');
 const logger = require('../config/logger');
 const { sendEmail } = require('./emailService');
 const { safeFetch } = require('../utils/safeFetch');
-const { isEncryptedIntegrationSecret, withDecryptedIntegrationSecret } = require('./integrationSecrets');
+const {
+  isEncryptedIntegrationSecret,
+  withDecryptedIntegrationSecret,
+} = require('./integrationSecrets');
 
 const WEBHOOK_EVENTS = {
   CAMPAIGN_FUNDED: 'campaign.funded',
@@ -83,7 +86,7 @@ async function emitWebhookEventForUser(ownerUserId, eventType, payload) {
     );
     const deliveryId = inserted[0].id;
     setImmediate(() => {
-      processDelivery(deliveryId).catch((err) =>
+      processDelivery(deliveryId).catch(err =>
         logger.error('[webhooks] delivery failed', { deliveryId, err: err.message })
       );
     });
@@ -115,7 +118,6 @@ async function notifyCreatorOfFailedDelivery(deliveryId, errMsg) {
     logger.error('[webhooks] failed to notify creator', { deliveryId, err: emailErr.message });
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // Delivery claims (#838)
@@ -197,13 +199,34 @@ async function claimDelivery(kind, deliveryId, leaseToken = newLeaseToken()) {
        AND ${k.hookUsableSql}
         AND d.attempt_count < $4
        AND ${claimableSql(3)}
-     RETURNING d.id, d.attempt_count, d.payload, d.${k.eventColumn} AS event_type,
+     RETURNING d.id, d.webhook_id, d.attempt_count, d.payload, d.${k.eventColumn} AS event_type,
                d.lease_token, w.url, w.secret, w.backoff_strategy, w.${k.ownerColumn} AS owner_id${
-                 kind === 'user' ? ', w.secret_version, w.previous_secret, w.previous_secret_version, w.previous_secret_expires_at' : ''
+                 kind === 'user'
+                   ? ', w.secret_version, w.previous_secret, w.previous_secret_version, w.previous_secret_expires_at'
+                   : ''
                }`,
     [deliveryId, leaseToken, WEBHOOK_LEASE_MS, k.maxAttempts]
   );
-  return rows[0] || null;
+  const claimed = rows[0] || null;
+  if (claimed) {
+    try {
+      await db.query(
+        `INSERT INTO webhook_delivery_attempts
+           (delivery_kind, delivery_id, attempt_number)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (delivery_kind, delivery_id, attempt_number) DO NOTHING`,
+        [kind, claimed.id, claimed.attempt_count]
+      );
+    } catch (err) {
+      // Attempt history is observability data; a transient write failure must
+      // not strand a claimed delivery in `delivering`.
+      logger.error(`${k.label} failed to record attempt history`, {
+        deliveryId: claimed.id,
+        error: err.message,
+      });
+    }
+  }
+  return claimed;
 }
 
 /**
@@ -225,14 +248,65 @@ async function failUnclaimableDelivery(kind, deliveryId) {
      WHERE d.id = $1 AND w.id = d.webhook_id
        AND (NOT (${k.hookUsableSql}) OR d.attempt_count >= $2)
        AND ${claimableSql(3)}
-     RETURNING d.id, d.last_error`,
+     RETURNING d.id, d.webhook_id, d.${k.eventColumn} AS event_type, d.attempt_count,
+               d.last_error, d.response_status`,
     [deliveryId, k.maxAttempts, WEBHOOK_LEASE_MS]
   );
   return rows[0] || null;
 }
 
+async function createDeadLetter(kind, deliveryId, fallback = {}) {
+  const k = DELIVERY_KINDS[kind];
+  const { rows } = await db.query(
+    `SELECT webhook_id, ${k.eventColumn} AS event_type, attempt_count,
+            last_error, response_status
+       FROM ${k.deliveriesTable} WHERE id = $1`,
+    [deliveryId]
+  );
+  const delivery = rows[0] || fallback;
+  if (!delivery.webhook_id || !delivery.event_type) return;
+  await db.query(
+    `INSERT INTO webhook_dead_letters
+       (delivery_kind, delivery_id, webhook_id, event_type, attempt_count, last_error, safe_metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+     ON CONFLICT (delivery_kind, delivery_id) DO UPDATE
+       SET attempt_count = EXCLUDED.attempt_count,
+           last_error = EXCLUDED.last_error,
+           safe_metadata = EXCLUDED.safe_metadata`,
+    [
+      kind,
+      deliveryId,
+      delivery.webhook_id,
+      delivery.event_type,
+      delivery.attempt_count || 0,
+      delivery.last_error || fallback.last_error || null,
+      JSON.stringify({
+        delivery_id: deliveryId,
+        event_type: delivery.event_type,
+        response_status: delivery.response_status || fallback.response_status || null,
+      }),
+    ]
+  );
+}
+
+async function finishDeliveryAttempt(kind, deliveryId, attemptNumber, outcome = {}) {
+  await db.query(
+    `UPDATE webhook_delivery_attempts
+        SET finished_at = NOW(), response_status = $4, succeeded = $5, error_message = $6
+      WHERE delivery_kind = $1 AND delivery_id = $2 AND attempt_number = $3`,
+    [
+      kind,
+      deliveryId,
+      attemptNumber,
+      outcome.responseStatus || null,
+      Boolean(outcome.succeeded),
+      outcome.error || null,
+    ]
+  );
+}
+
 /** Record an attempt's outcome, only if this worker still holds the lease. */
-async function finishAttempt(kind, deliveryId, leaseToken, setSql, params) {
+async function finishAttempt(kind, deliveryId, leaseToken, setSql, params, attemptOutcome = null) {
   const k = DELIVERY_KINDS[kind];
   const result = await db.query(
     `UPDATE ${k.deliveriesTable}
@@ -245,6 +319,9 @@ async function finishAttempt(kind, deliveryId, leaseToken, setSql, params) {
   if (!owned) {
     logger.warn(`${k.label} attempt outcome discarded: lease no longer held`, { deliveryId });
   }
+  if (owned && attemptOutcome) {
+    await finishDeliveryAttempt(kind, deliveryId, attemptOutcome.attemptNumber, attemptOutcome);
+  }
   return owned;
 }
 
@@ -253,7 +330,7 @@ function scheduleRetryTimer(kind, deliveryId, delay) {
   // Fast path only: the claim makes an overlap with the poller harmless, and
   // the poller recovers the retry if this process exits before the timer fires.
   const timer = setTimeout(() => {
-    runDelivery(kind, deliveryId).catch((err) =>
+    runDelivery(kind, deliveryId).catch(err =>
       logger.error(`${k.label} retry failed`, { deliveryId, err: err.message })
     );
   }, delay);
@@ -265,17 +342,17 @@ async function recordFailure(kind, claimed, errMsg, httpStatus, snippet, version
   const attemptJustUsed = claimed.attempt_count;
   const extraSql = [];
   const extra = [];
-  
+
   if (k.storesSnippet) {
     extraSql.push(`response_body_snippet = $${4 + (k.tracksFailedAt ? 1 : 0)}`);
     extra.push(snippet);
   }
-  
+
   if (kind === 'user' && versionsUsed) {
     extraSql.push(`signature_versions = $${4 + (k.tracksFailedAt ? 1 : 0) + extra.length}`);
     extra.push(versionsUsed);
   }
-  
+
   const extraSqlStr = extraSql.length ? `, ${extraSql.join(', ')}` : '';
 
   if (attemptJustUsed >= k.maxAttempts) {
@@ -286,15 +363,20 @@ async function recordFailure(kind, claimed, errMsg, httpStatus, snippet, version
       `status = 'failed', last_error = $3, response_status = $4, next_retry_at = NULL${
         k.tracksFailedAt ? ', failed_at = NOW()' : ''
       }${extraSqlStr}`,
-      [errMsg, httpStatus, ...extra]
+      [errMsg, httpStatus, ...extra],
+      { attemptNumber: attemptJustUsed, responseStatus: httpStatus, error: errMsg }
     );
-    if (owned && kind === 'user') await notifyCreatorOfFailedDelivery(claimed.id, errMsg);
+    if (owned) {
+      await createDeadLetter(kind, claimed.id, { last_error: errMsg, response_status: httpStatus });
+      if (kind === 'user') await notifyCreatorOfFailedDelivery(claimed.id, errMsg);
+    }
     return;
   }
 
-  const delay = kind === 'user'
-    ? backoffMs(attemptJustUsed, claimed.backoff_strategy)
-    : backoffMsForCampaign(attemptJustUsed, claimed.backoff_strategy);
+  const delay =
+    kind === 'user'
+      ? backoffMs(attemptJustUsed, claimed.backoff_strategy)
+      : backoffMsForCampaign(attemptJustUsed, claimed.backoff_strategy);
   // next_retry_at comes from the database clock, the same clock the claim
   // compares it against, so app/DB clock skew cannot make a retry early or late.
   const owned = await finishAttempt(
@@ -303,7 +385,8 @@ async function recordFailure(kind, claimed, errMsg, httpStatus, snippet, version
     claimed.lease_token,
     `status = 'retrying', next_retry_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
      last_error = $4, response_status = $5${extraSqlStr}`,
-    [delay, errMsg, httpStatus, ...extra]
+    [delay, errMsg, httpStatus, ...extra],
+    { attemptNumber: attemptJustUsed, responseStatus: httpStatus, error: errMsg }
   );
   if (owned) scheduleRetryTimer(kind, claimed.id, delay);
 }
@@ -313,14 +396,17 @@ async function runDelivery(kind, deliveryId) {
   const claimed = await claimDelivery(kind, deliveryId);
   if (!claimed) {
     const closed = await failUnclaimableDelivery(kind, deliveryId);
-    if (closed && kind === 'user' && closed.last_error === 'max delivery attempts exceeded') {
-      await notifyCreatorOfFailedDelivery(deliveryId, closed.last_error);
+    if (closed) {
+      await createDeadLetter(kind, deliveryId, closed);
+      if (kind === 'user' && closed.last_error === 'max delivery attempts exceeded') {
+        await notifyCreatorOfFailedDelivery(deliveryId, closed.last_error);
+      }
     }
     return { sent: false };
   }
 
   const bodyUtf8 = JSON.stringify(claimed.payload);
-  
+
   const signatures = [];
   const versionsUsed = [];
 
@@ -329,7 +415,7 @@ async function runDelivery(kind, deliveryId) {
       await withDecryptedIntegrationSecret(
         secretValue,
         { type: k.ownerContextType, id: claimed.owner_id },
-        (decryptedSecret) => {
+        decryptedSecret => {
           signatures.push(`v${versionLabel}=${hmacSignature(decryptedSecret, bodyUtf8)}`);
         }
       );
@@ -378,8 +464,10 @@ async function runDelivery(kind, deliveryId) {
         claimed.id,
         claimed.lease_token,
         `status = 'failed', last_error = $3, next_retry_at = NULL${k.tracksFailedAt ? ', failed_at = NOW()' : ''}`,
-        [err.message]
+        [err.message],
+        { attemptNumber: claimed.attempt_count, error: err.message }
       );
+      await createDeadLetter(kind, claimed.id, { last_error: err.message });
       return { sent: false };
     }
     await recordFailure(kind, claimed, err.message || String(err), null, null, versionsUsed);
@@ -387,7 +475,7 @@ async function runDelivery(kind, deliveryId) {
   }
 
   const snippet = responseText.slice(0, 512);
-  
+
   let finishSetSql = `status = 'delivered', response_status = $3, delivered_at = NOW(), next_retry_at = NULL, last_error = NULL${
     k.storesSnippet ? ', response_body_snippet = $4' : ''
   }`;
@@ -399,13 +487,11 @@ async function runDelivery(kind, deliveryId) {
   }
 
   if (res.ok) {
-    await finishAttempt(
-      kind,
-      claimed.id,
-      claimed.lease_token,
-      finishSetSql,
-      finishParams
-    );
+    await finishAttempt(kind, claimed.id, claimed.lease_token, finishSetSql, finishParams, {
+      attemptNumber: claimed.attempt_count,
+      responseStatus: res.status,
+      succeeded: true,
+    });
     return { sent: true };
   }
 
@@ -438,10 +524,13 @@ async function processDueDeliveries(kind) {
      LIMIT $2`,
     [WEBHOOK_LEASE_MS, POLLER_BATCH_SIZE]
   );
-  const results = await Promise.allSettled(rows.map((r) => runDelivery(kind, r.id)));
+  const results = await Promise.allSettled(rows.map(r => runDelivery(kind, r.id)));
   results.forEach((r, i) => {
     if (r.status === 'rejected') {
-      logger.error(`${k.label} poller delivery failed`, { deliveryId: rows[i].id, err: r.reason && r.reason.message });
+      logger.error(`${k.label} poller delivery failed`, {
+        deliveryId: rows[i].id,
+        err: r.reason && r.reason.message,
+      });
     }
   });
   return rows.length;
@@ -471,7 +560,7 @@ async function emitWebhookEventForCampaign(campaignId, eventType, payload) {
     );
     const deliveryId = inserted[0].id;
     setImmediate(() => {
-      processCampaignWebhookDelivery(deliveryId).catch((err) =>
+      processCampaignWebhookDelivery(deliveryId).catch(err =>
         logger.error('[campaign-webhooks] delivery failed', { deliveryId, err: err.message })
       );
     });
@@ -487,8 +576,8 @@ function startWebhookRetryPoller() {
     running = true;
     try {
       await Promise.all([
-        processDueRetries().catch((e) => logger.error('[webhooks] poller error', { err: e.message })),
-        processDueCampaignWebhookRetries().catch((e) =>
+        processDueRetries().catch(e => logger.error('[webhooks] poller error', { err: e.message })),
+        processDueCampaignWebhookRetries().catch(e =>
           logger.error('[campaign-webhooks] poller error', { err: e.message })
         ),
       ]);
