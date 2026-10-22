@@ -15,10 +15,22 @@ const impactStatsLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
-  keyGenerator: (req) => ipKeyGenerator(req.ip),
+  keyGenerator: req => ipKeyGenerator(req.ip),
+});
+
+// Browser CSP reports are unauthenticated. Keep the bucket small so a noisy
+// or malicious page cannot flood the collector or the database.
+const cspReportLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many CSP reports, please try again later.' },
+  keyGenerator: req => ipKeyGenerator(req.ip),
 });
 
 module.exports = {
   embedStatsLimiter,
   impactStatsLimiter,
+  cspReportLimiter,
 };

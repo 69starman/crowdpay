@@ -18,7 +18,7 @@ const { ipKeyGenerator } = rateLimit;
 // The window reset tests use a custom limiter with a short window
 process.env.RATE_LIMIT_WINDOW_MS = '1000';
 
-const { embedStatsLimiter, impactStatsLimiter } = require('./rateLimiter');
+const { embedStatsLimiter, impactStatsLimiter, cspReportLimiter } = require('./rateLimiter');
 
 // ---------------------------------------------------------------------------
 // Build a minimal test app
@@ -79,6 +79,22 @@ describe('Rate Limiter Middleware', () => {
     });
   });
 
+  // ── cspReportLimiter ─────────────────────────────────────────────────────
+  describe('cspReportLimiter', () => {
+    it('limits CSP reports to 30 per minute per IP', async () => {
+      const app = express();
+      app.post('/csp-report', cspReportLimiter, (_req, res) => res.status(204).end());
+      const cspAgent = supertest(app);
+
+      for (let i = 0; i < 30; i += 1) {
+        const res = await cspAgent.post('/csp-report').send({});
+        assert.equal(res.status, 204);
+      }
+      const limited = await cspAgent.post('/csp-report').send({});
+      assert.equal(limited.status, 429);
+    });
+  });
+
   // ── Window Reset Tests (using custom limiters with short windows) ────────
   describe('window reset behavior', () => {
     it('resets embedStatsLimiter window after windowMs expires', async () => {
@@ -87,7 +103,7 @@ describe('Rate Limiter Middleware', () => {
         max: 2,
         standardHeaders: true,
         legacyHeaders: false,
-        keyGenerator: (req) => 'test-embed-window-reset',
+        keyGenerator: req => 'test-embed-window-reset',
         message: { error: 'Too many requests' },
       });
 
@@ -117,7 +133,7 @@ describe('Rate Limiter Middleware', () => {
         max: 2,
         standardHeaders: true,
         legacyHeaders: false,
-        keyGenerator: (req) => 'test-impact-window-reset',
+        keyGenerator: req => 'test-impact-window-reset',
         message: { error: 'Too many requests' },
       });
 

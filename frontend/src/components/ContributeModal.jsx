@@ -11,6 +11,7 @@ import { api } from '../services/api';
 import { getDeviceFingerprint } from '../lib/deviceFingerprint';
 import { stellarExpertTxUrl } from '../config/stellar';
 import KycPrompt from './KycPrompt';
+import { useExchangeRate } from '../hooks/useExchangeRate';
 
 const SEND_OPTIONS = [
   { value: 'XLM', label: 'XLM', hint: 'Native Stellar' },
@@ -95,9 +96,7 @@ function matchTier(tiers, amount) {
   const numAmount = parseFloat(amount);
   if (isNaN(numAmount)) return null;
 
-  const eligible = tiers.filter(
-    (t) => numAmount >= parseFloat(t.min_amount) && !t.sold_out
-  );
+  const eligible = tiers.filter((t) => numAmount >= parseFloat(t.min_amount) && !t.sold_out);
 
   if (eligible.length === 0) return null;
 
@@ -123,6 +122,10 @@ export default function ContributeModal({
 }) {
   const { user, token, updateUser } = useAuth();
   const [amount, setAmount] = useState(initialAmount);
+  const { formatNaira } = useExchangeRate(campaign.asset_type || 'USDC');
+  const nairaAmount = formatNaira(amount);
+  const minNaira = campaign.min_contribution ? formatNaira(campaign.min_contribution) : null;
+  const maxNaira = campaign.max_contribution ? formatNaira(campaign.max_contribution) : null;
   const [sendAsset, setSendAsset] = useState(campaign.asset_type);
   const [paymentMethod, setPaymentMethod] = useState(
     guestFreighterMode ? 'freighter' : 'custodial'
@@ -141,6 +144,7 @@ export default function ContributeModal({
   const [previewToken, setPreviewToken] = useState(null);
   const [phase, setPhase] = useState('form');
   const [result, setResult] = useState(null);
+  const [rebuildRequested, setRebuildRequested] = useState(false);
   const [feeBps, setFeeBps] = useState(0);
 
   useEffect(() => {
@@ -153,6 +157,10 @@ export default function ContributeModal({
   const [freighterChecked, setFreighterChecked] = useState(false);
   const [existingContributions, setExistingContributions] = useState([]);
   const [displayName, setDisplayName] = useState('');
+  const [giftEnabled, setGiftEnabled] = useState(false);
+  const [giftRecipientName, setGiftRecipientName] = useState('');
+  const [giftRecipientEmail, setGiftRecipientEmail] = useState('');
+  const [giftMessage, setGiftMessage] = useState('');
   const anchorPopupRef = useRef(null);
   const submitLockRef = useRef(false);
   const activeSubmissionKeyRef = useRef(null);
@@ -165,7 +173,7 @@ export default function ContributeModal({
     anchorInfo.anchors.find((anchor) => anchor.id === selectedAnchorId) || null;
   const effectiveSendAsset =
     paymentMethod === 'anchor' ? selectedAnchor?.asset?.code || campaign.asset_type : sendAsset;
-const isPathPayment = effectiveSendAsset !== campaign.asset_type;
+  const isPathPayment = effectiveSendAsset !== campaign.asset_type;
   const destAmount = amount.trim();
   const matchedTier = matchTier(tiers, destAmount);
   const [unlockedTier, setUnlockedTier] = useState(null);
@@ -420,6 +428,15 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
         amount: destAmount,
         send_asset: sendAsset,
         display_name: displayName.trim() || undefined,
+        ...(giftEnabled
+          ? {
+              gift: {
+                recipient_name: giftRecipientName.trim(),
+                recipient_email: giftRecipientEmail.trim(),
+                message: giftMessage.trim() || undefined,
+              },
+            }
+          : {}),
         device_fingerprint: device_fingerprint || undefined,
         idempotency_key: activeSubmissionKeyRef.current,
         ...(isPathPayment && previewToken
@@ -486,7 +503,16 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
     if (network?.networkPassphrase !== prepared.network_passphrase) {
       const current = network?.network || 'another network';
       throw new Error(
-        `Freighter is connected to ${current}. Switch it to ${prepared.network_name} and try again.`
+        `Freighter is connected to the ${current} network. This campaign is configured for the ${prepared.network_name} network. ` +
+          'Switch your wallet network and try again, or use the rebuild path below to generate a new quote for the correct network.'
+      );
+    }
+
+    // Check if the prepared transaction is expired
+    if (prepared.timeBounds && new Date(prepared.timeBounds.maxTime * 1000) < new Date()) {
+      throw new Error(
+        'This transaction has expired. Please <button className="link-btn" onClick={() => setPhase("rebuild")}>rebuild the quote</button> ' +
+          'or refresh the page to generate a new quote for the current network.'
       );
     }
 
@@ -552,6 +578,15 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
         amount: destAmount,
         send_asset: effectiveSendAsset,
         display_name: displayName || undefined,
+        ...(giftEnabled
+          ? {
+              gift: {
+                recipient_name: giftRecipientName.trim(),
+                recipient_email: giftRecipientEmail.trim(),
+                message: giftMessage.trim() || undefined,
+              },
+            }
+          : {}),
         idempotency_key: activeSubmissionKeyRef.current,
       },
       referralQuery
@@ -630,7 +665,8 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
               onSuccess();
               return;
             }
-} catch (_err) { // eslint-disable-line no-unused-vars -- intentionally unused, just continue polling
+          } catch (_err) {
+            // eslint-disable-line no-unused-vars -- intentionally unused, just continue polling
             // Keep polling on error
           }
         }
@@ -647,6 +683,11 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
       }
       if (err?.message === SIGNING_CANCELLED) {
         setError('Signing cancelled. Nothing was sent — you can start the payment again.');
+      } else if (err?.message && err.message.includes('expired')) {
+        setError('This transaction has expired. Click "Rebuild quote" to generate a new quote, or refresh the page.');
+        setRebuildRequested(true);
+      } else if (err?.message && err.message.includes('network')) {
+        setError('Network mismatch detected. Please switch your wallet to the correct network and try again.');
       } else {
         setError(
           paymentMethod === 'freighter'
@@ -808,9 +849,9 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                       style={{ marginBottom: '1rem' }}
                       role="status"
                     >
-                      <strong>{selectedAnchor.name}.</strong> We&apos;ll open a secure identity and payment
-                      window. Once your payment clears, your contribution is submitted automatically —
-                      no further steps needed.
+                      <strong>{selectedAnchor.name}.</strong> We&apos;ll open a secure identity and
+                      payment window. Once your payment clears, your contribution is submitted
+                      automatically — no further steps needed.
                     </div>
                   )}
                 </>
@@ -855,6 +896,20 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                   onChange={(e) => setAmount(e.target.value)}
                   aria-describedby="contrib-amount-help"
                 />
+                {nairaAmount && (
+                  <div
+                    className="contrib-naira-approx"
+                    style={{
+                      fontSize: '0.85rem',
+                      color: 'var(--color-text-secondary)',
+                      marginTop: '0.35rem',
+                      fontWeight: 500,
+                    }}
+                    aria-label={`approximate naira value: ₦${nairaAmount}`}
+                  >
+                    ≈ ₦{nairaAmount} (approx.)
+                  </div>
+                )}
                 <span id="contrib-amount-help" style={styles.help}>
                   <span style={{ display: 'block', marginBottom: '0.25rem' }}>
                     This is the credited amount toward the campaign goal, in {campaign.asset_type}.
@@ -883,6 +938,7 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                             Minimum per contribution:{' '}
                             {Number(campaign.min_contribution).toLocaleString()}{' '}
                             {campaign.asset_type}
+                            {minNaira && ` (≈ ₦${minNaira} approx.)`}
                           </li>
                         )}
                         {campaign.max_contribution && (
@@ -890,6 +946,7 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                             Maximum per contribution:{' '}
                             {Number(campaign.max_contribution).toLocaleString()}{' '}
                             {campaign.asset_type}
+                            {maxNaira && ` (≈ ₦${maxNaira} approx.)`}
                           </li>
                         )}
                         {campaign.max_per_user &&
@@ -919,17 +976,27 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                 </span>
               </div>
 
-              {tiers.length > 0 && destAmount && Number(destAmount) > 0 && (
-                matchedTier ? (
-                  <div className="alert alert--success" style={{ marginBottom: '1rem', fontSize: '0.85rem' }} role="status">
-                    <strong>Unlocks tier:</strong> {matchedTier.title} (from {Number(matchedTier.min_amount).toLocaleString()} {campaign.asset_type})
+              {tiers.length > 0 &&
+                destAmount &&
+                Number(destAmount) > 0 &&
+                (matchedTier ? (
+                  <div
+                    className="alert alert--success"
+                    style={{ marginBottom: '1rem', fontSize: '0.85rem' }}
+                    role="status"
+                  >
+                    <strong>Unlocks tier:</strong> {matchedTier.title} (from{' '}
+                    {Number(matchedTier.min_amount).toLocaleString()} {campaign.asset_type})
                   </div>
                 ) : (
-                  <div className="alert alert--info" style={{ marginBottom: '1rem', fontSize: '0.85rem' }} role="status">
+                  <div
+                    className="alert alert--info"
+                    style={{ marginBottom: '1rem', fontSize: '0.85rem' }}
+                    role="status"
+                  >
                     This amount does not yet reach a reward tier.
                   </div>
-                )
-              )}
+                ))}
 
               <div className="form-stack" style={{ marginBottom: '1rem' }}>
                 <label className="label-strong" htmlFor="contrib-display-name">
@@ -950,24 +1017,71 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                 </span>
               </div>
 
+              {paymentMethod !== 'freighter' && (
+                <fieldset className="form-stack" style={{ marginBottom: '1rem' }}>
+                  <legend className="label-strong">Gift this contribution</legend>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={giftEnabled}
+                      onChange={(event) => setGiftEnabled(event.target.checked)}
+                    />{' '}
+                    Notify someone that you contributed in their honor
+                  </label>
+                  {giftEnabled && (
+                    <>
+                      <label htmlFor="gift-recipient-name">Recipient name</label>
+                      <input
+                        id="gift-recipient-name"
+                        value={giftRecipientName}
+                        onChange={(event) => setGiftRecipientName(event.target.value)}
+                        maxLength={100}
+                        required
+                      />
+                      <label htmlFor="gift-recipient-email">Recipient email</label>
+                      <input
+                        id="gift-recipient-email"
+                        type="email"
+                        value={giftRecipientEmail}
+                        onChange={(event) => setGiftRecipientEmail(event.target.value)}
+                        maxLength={254}
+                        required
+                      />
+                      <label htmlFor="gift-message">Message (optional)</label>
+                      <textarea
+                        id="gift-message"
+                        value={giftMessage}
+                        onChange={(event) => setGiftMessage(event.target.value)}
+                        maxLength={280}
+                      />
+                      <span style={styles.help}>
+                        The recipient is emailed only after the contribution is confirmed on
+                        Stellar.
+                      </span>
+                    </>
+                  )}
+                </fieldset>
+              )}
+
               {isPathPayment && (
                 <div className="alert alert--info" style={{ marginTop: '0.85rem' }} role="status">
-                  <strong>Automatic conversion.</strong> We&apos;ll convert your {effectiveSendAsset} to{' '}
-                  {campaign.asset_type} when you confirm. Fees are minimal.
+                  <strong>Automatic conversion.</strong> We&apos;ll convert your{' '}
+                  {effectiveSendAsset} to {campaign.asset_type} when you confirm. Fees are minimal.
                 </div>
               )}
 
               {paymentMethod === 'freighter' && (
                 <div className="alert alert--info" style={{ marginTop: '0.85rem' }} role="status">
-                  <strong>You stay in control.</strong> We&apos;ll prepare the payment, your wallet will ask
-                  you to approve it, and only your approval comes back to us — we never see your keys.
+                  <strong>You stay in control.</strong> We&apos;ll prepare the payment, your wallet
+                  will ask you to approve it, and only your approval comes back to us — we never see
+                  your keys.
                 </div>
               )}
 
               {paymentMethod === 'anchor' && selectedAnchor && (
                 <div className="alert alert--info" style={{ marginTop: '0.85rem' }} role="status">
-                  <strong>{selectedAnchor.name}.</strong> Your bank or card payment is verified, then
-                  your contribution is submitted for you automatically.
+                  <strong>{selectedAnchor.name}.</strong> Your bank or card payment is verified,
+                  then your contribution is submitted for you automatically.
                 </div>
               )}
 
@@ -997,10 +1111,7 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                     </div>
                   )}
                   {!quoteLoading && quote && rankedPaths.length > 1 && (
-                    <div
-                      className="form-stack"
-                      style={{ marginTop: '0.5rem' }}
-                    >
+                    <div className="form-stack" style={{ marginTop: '0.5rem' }}>
                       <label
                         className="label-strong"
                         htmlFor="contrib-path-select"
@@ -1057,6 +1168,35 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                   {error}
                 </p>
               )}
+              {rebuildRequested && (
+                <div style={{ marginTop: '0.85rem', minHeight: '3.5rem' }}>
+                  <p style={{ fontSize: '0.85rem', color: 'var(--color-text-hint)' }}>
+                    Enter the contribution amount to rebuild the quote for the correct network.
+                  </p>
+                  <input
+                    id="contrib-amount"
+                    type="number"
+                    inputMode="decimal"
+                    min="0.0000001"
+                    step="any"
+                    placeholder="0.00"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    style={{ marginTop: '0.5rem' }}
+                    onClick={async () => {
+                      setRebuildRequested(false);
+                      setPhase('form');
+                      fetchQuote();
+                    }}
+                  >
+                    Rebuild quote
+                  </button>
+                </div>
+              )}
 
               <div style={styles.actions}>
                 {signingInFlight ? (
@@ -1074,38 +1214,38 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                   disabled={loading || quoteLoading || (isPathPayment && (!!quoteError || !quote))}
                   aria-busy={loading ? 'true' : 'false'}
                 >
-                  {loading
-                    ? (
-                        <span
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            gap: '0.5rem',
-                          }}
-                        >
-                          <span
-                            aria-hidden="true"
-                            style={{
-                              width: '0.95rem',
-                              height: '0.95rem',
-                              border: '2px solid rgba(255, 255, 255, 0.35)',
-                              borderTopColor: '#fff',
-                              borderRadius: '50%',
-                              animation: 'spin 0.8s linear infinite',
-                              flexShrink: 0,
-                            }}
-                          />
-                          <span>{loadingLabel}</span>
-                        </span>
-                      )
-                    : quoteLoading
-                      ? 'Loading quote…'
-                      : paymentMethod === 'anchor'
-                        ? 'Open deposit flow'
-                        : paymentMethod === 'freighter'
-                          ? 'Review in Freighter'
-                          : 'Confirm payment'}
+                  {loading ? (
+                    <span
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '0.5rem',
+                      }}
+                    >
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          width: '0.95rem',
+                          height: '0.95rem',
+                          border: '2px solid rgba(255, 255, 255, 0.35)',
+                          borderTopColor: '#fff',
+                          borderRadius: '50%',
+                          animation: 'spin 0.8s linear infinite',
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span>{loadingLabel}</span>
+                    </span>
+                  ) : quoteLoading ? (
+                    'Loading quote…'
+                  ) : paymentMethod === 'anchor' ? (
+                    'Open deposit flow'
+                  ) : paymentMethod === 'freighter' ? (
+                    'Review in Freighter'
+                  ) : (
+                    'Confirm payment'
+                  )}
                 </button>
               </div>
             </form>
@@ -1219,13 +1359,22 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
               Your contribution is on its way. It usually confirms in just a few seconds.
             </p>
             {unlockedTier && (
-              <p className="alert alert--success" style={{ marginBottom: '1rem', fontSize: '0.9rem' }} role="status">
+              <p
+                className="alert alert--success"
+                style={{ marginBottom: '1rem', fontSize: '0.9rem' }}
+                role="status"
+              >
                 🎉 {"You've"} unlocked: <strong>{unlockedTier.title}</strong>
               </p>
             )}
             {result?.nft_reward && (
-              <p className="alert alert--info" style={{ marginBottom: '1rem', fontSize: '0.9rem' }} role="status">
-                NFT reward record is being prepared for this contribution. Its status will appear in your profile once available.
+              <p
+                className="alert alert--info"
+                style={{ marginBottom: '1rem', fontSize: '0.9rem' }}
+                role="status"
+              >
+                NFT reward record is being prepared for this contribution. Its status will appear in
+                your profile once available.
               </p>
             )}
             {(result?.tx_hash || result?.conversion_quote || result?.anchor_transaction_id) && (
@@ -1237,7 +1386,13 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
                 </summary>
                 <div style={{ marginTop: '0.6rem' }}>
                   {result?.tx_hash && (
-                    <p style={{ fontSize: '0.875rem', marginBottom: '0.5rem', wordBreak: 'break-all' }}>
+                    <p
+                      style={{
+                        fontSize: '0.875rem',
+                        marginBottom: '0.5rem',
+                        wordBreak: 'break-all',
+                      }}
+                    >
                       <strong>Transaction</strong>{' '}
                       <a
                         href={stellarExpertTxUrl(result.tx_hash)}
@@ -1287,47 +1442,60 @@ const isPathPayment = effectiveSendAsset !== campaign.asset_type;
               </h3>
               <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <button
-  type="button"
-  className="btn-secondary"
-  style={{ flex: 1, fontSize: '0.85rem' }}
-  aria-label="Share on X"
-  onClick={() => {
-    const shareUrl = window.location.href;
-    const pct = Math.min(100, (campaign.raised_amount / campaign.target_amount) * 100).toFixed(1);
-    const daysLeft = Math.max(0, Math.ceil((new Date(campaign.end_date) - new Date()) / (1000 * 60 * 60 * 24)));
-    const text = encodeURIComponent(`Back ${campaign.title} on CrowdPay — ${pct}% funded, ${daysLeft} days left. ${shareUrl} #CrowdPay`);
-    window.open(`https://twitter.com/intent/tweet?text=${text}`, '_blank');
-  }}
->
-  Share on X
-</button>
-<button
-  type="button"
-  className="btn-secondary"
-  style={{ flex: 1, fontSize: '0.85rem' }}
-  aria-label="Share on WhatsApp"
-  onClick={() => {
-    const shareUrl = window.location.href;
-    const pct = Math.min(100, (campaign.raised_amount / campaign.target_amount) * 100).toFixed(1);
-    const text = encodeURIComponent(`Hey! Check out this campaign on CrowdPay: ${campaign.title}. They're ${pct}% funded and need your help. ${shareUrl}`);
-    window.open(`https://wa.me/?text=${text}`, '_blank');
-  }}
->
-  WhatsApp
-</button>
-<button
-  type="button"
-  className="btn-secondary"
-  style={{ flex: 1, fontSize: '0.85rem' }}
-  aria-label="Share on LinkedIn"
-  onClick={() => {
-    const shareUrl = window.location.href;
-    const linkedInUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(shareUrl)}`;
-    window.open(linkedInUrl, '_blank');
-  }}
->
-  LinkedIn
-</button>
+                  type="button"
+                  className="btn-secondary"
+                  style={{ flex: 1, fontSize: '0.85rem' }}
+                  aria-label="Share on X"
+                  onClick={() => {
+                    const shareUrl = window.location.href;
+                    const pct = Math.min(
+                      100,
+                      (campaign.raised_amount / campaign.target_amount) * 100
+                    ).toFixed(1);
+                    const daysLeft = Math.max(
+                      0,
+                      Math.ceil((new Date(campaign.end_date) - new Date()) / (1000 * 60 * 60 * 24))
+                    );
+                    const text = encodeURIComponent(
+                      `Back ${campaign.title} on CrowdPay — ${pct}% funded, ${daysLeft} days left. ${shareUrl} #CrowdPay`
+                    );
+                    window.open(`https://twitter.com/intent/tweet?text=${text}`, '_blank');
+                  }}
+                >
+                  Share on X
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ flex: 1, fontSize: '0.85rem' }}
+                  aria-label="Share on WhatsApp"
+                  onClick={() => {
+                    const shareUrl = window.location.href;
+                    const pct = Math.min(
+                      100,
+                      (campaign.raised_amount / campaign.target_amount) * 100
+                    ).toFixed(1);
+                    const text = encodeURIComponent(
+                      `Hey! Check out this campaign on CrowdPay: ${campaign.title}. They're ${pct}% funded and need your help. ${shareUrl}`
+                    );
+                    window.open(`https://wa.me/?text=${text}`, '_blank');
+                  }}
+                >
+                  WhatsApp
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ flex: 1, fontSize: '0.85rem' }}
+                  aria-label="Share on LinkedIn"
+                  onClick={() => {
+                    const shareUrl = window.location.href;
+                    const linkedInUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(shareUrl)}`;
+                    window.open(linkedInUrl, '_blank');
+                  }}
+                >
+                  LinkedIn
+                </button>
               </div>
             </div>
 
@@ -1379,4 +1547,3 @@ const styles = {
     marginTop: '1.1rem',
   },
 };
-

@@ -2,7 +2,11 @@ const db = require('../config/database');
 const logger = require('../config/logger');
 const { sendEmail } = require('./emailService');
 
+const { toStroops, STROOPS_PER_UNIT, fromStroops } = require('../utils/stroops');
+
 const FRAUD_THRESHOLD = 75;
+const THRESHOLD_HIGH_STROOPS = 10000n * STROOPS_PER_UNIT;
+const THRESHOLD_MEDIUM_STROOPS = 5000n * STROOPS_PER_UNIT;
 
 /**
  * Extract and calculate feature vectors for a contribution.
@@ -22,10 +26,9 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
       );
       recentCount = parseInt(rows[0]?.cnt || '0', 10);
 
-      const { rows: userRows } = await db.query(
-        `SELECT created_at FROM users WHERE id = $1`,
-        [userId]
-      );
+      const { rows: userRows } = await db.query(`SELECT created_at FROM users WHERE id = $1`, [
+        userId,
+      ]);
       if (userRows[0]?.created_at) {
         const diffMs = Date.now() - new Date(userRows[0].created_at).getTime();
         walletAgeDays = Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
@@ -35,11 +38,27 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
     }
   }
 
-  // Lightweight classifier heuristic weights
+  // Decimal-safe contribution amount calculation using exact BigInt stroops (#1085)
   let amountScore = 0;
-  const numAmount = parseFloat(amount || 0);
-  if (numAmount > 10000) amountScore = 40;
-  else if (numAmount > 5000) amountScore = 20;
+  let stroops = 0n;
+  let canonicalAmount = '0.0000000';
+  if (amount !== undefined && amount !== null && amount !== '') {
+    try {
+      stroops = toStroops(amount, { allowZero: true });
+      canonicalAmount = fromStroops(stroops);
+    } catch (err) {
+      logger.warn('Failed to parse contribution amount for fraud scoring, defaulting to zero', {
+        error: err.message,
+        amount,
+      });
+    }
+  }
+
+  if (stroops > THRESHOLD_HIGH_STROOPS) {
+    amountScore = 40;
+  } else if (stroops > THRESHOLD_MEDIUM_STROOPS) {
+    amountScore = 20;
+  }
 
   let frequencyScore = 0;
   if (recentCount > 5) frequencyScore = 35;
@@ -52,10 +71,13 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
   let ipScore = ipAddress && ipAddress.startsWith('192.0.2.') ? 50 : 0;
   let deviceScore = deviceFingerprint && deviceFingerprint.includes('suspicious') ? 40 : 0;
 
-  const score = Math.min(100, amountScore + frequencyScore + walletAgeScore + ipScore + deviceScore);
+  const score = Math.min(
+    100,
+    amountScore + frequencyScore + walletAgeScore + ipScore + deviceScore
+  );
 
   const breakdown = {
-    amount: { score: amountScore, detail: `Amount: ${numAmount}` },
+    amount: { score: amountScore, detail: `Amount: ${canonicalAmount}` },
     frequency: { score: frequencyScore, detail: `Recent contributions (24h): ${recentCount}` },
     walletAge: { score: walletAgeScore, detail: `Wallet age days: ${walletAgeDays}` },
     ipReputation: { score: ipScore, detail: `IP: ${ipAddress || 'unknown'}` },
@@ -68,8 +90,20 @@ async function extractFeatures({ userId, amount, ipAddress, deviceFingerprint })
 /**
  * Score a contribution in real-time. Records the assessment and flags if high-risk.
  */
-async function scoreContribution({ contributionId, campaignId, userId, amount, ipAddress, deviceFingerprint }) {
-  const { score, breakdown, isHighRisk } = await extractFeatures({ userId, amount, ipAddress, deviceFingerprint });
+async function scoreContribution({
+  contributionId,
+  campaignId,
+  userId,
+  amount,
+  ipAddress,
+  deviceFingerprint,
+}) {
+  const { score, breakdown, isHighRisk } = await extractFeatures({
+    userId,
+    amount,
+    ipAddress,
+    deviceFingerprint,
+  });
 
   const status = isHighRisk ? 'held_for_review' : 'approved';
 
@@ -81,11 +115,19 @@ async function scoreContribution({ contributionId, campaignId, userId, amount, i
       [contributionId, campaignId, userId || null, score, JSON.stringify(breakdown), status]
     );
   } catch (err) {
-    logger.error('Failed to store contribution fraud score', { error: err.message, contributionId });
+    logger.error('Failed to store contribution fraud score', {
+      error: err.message,
+      contributionId,
+    });
   }
 
   if (isHighRisk) {
-    logger.warn('Contribution flagged for high fraud risk', { contributionId, campaignId, score, breakdown });
+    logger.warn('Contribution flagged for high fraud risk', {
+      contributionId,
+      campaignId,
+      score,
+      breakdown,
+    });
     // Optionally notify admins
   }
 
@@ -175,7 +217,9 @@ async function retrainModel() {
        RETURNING *`,
       [nextVersion]
     );
-    logger.warn('Fraud model retrain skipped scoring: no resolved review data yet', { version: nextVersion });
+    logger.warn('Fraud model retrain skipped scoring: no resolved review data yet', {
+      version: nextVersion,
+    });
     return {
       success: false,
       version: rows[0].version,
@@ -221,7 +265,7 @@ async function evaluateCampaign(campaignId) {
     [campaignId]
   );
   const results = await Promise.all(
-    rows.map((row) =>
+    rows.map(row =>
       scoreContribution({
         contributionId: row.id,
         campaignId,
@@ -229,10 +273,10 @@ async function evaluateCampaign(campaignId) {
         amount: row.amount,
         ipAddress: row.ip_address,
         deviceFingerprint: row.device_fingerprint,
-      }).catch((err) => ({ contributionId: row.id, error: err.message }))
+      }).catch(err => ({ contributionId: row.id, error: err.message }))
     )
   );
-  const highRisk = results.filter((r) => r.isHighRisk);
+  const highRisk = results.filter(r => r.isHighRisk);
   return { campaignId, assessed: results.length, highRisk: highRisk.length };
 }
 

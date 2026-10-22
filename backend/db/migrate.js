@@ -9,6 +9,8 @@ const {
   validateMigrationFiles,
   listAllMigrationFilenames,
   loadApplied,
+  acquireMigrationLock,
+  releaseMigrationLock,
 } = require('./migrateLib');
 
 // Match backend/.env.example and docker-compose db service defaults.
@@ -41,13 +43,16 @@ const ALREADY_CREATED_CODES = new Set([
   '42710', // duplicate_object (constraints/indexes on existing objects)
 ]);
 
-async function runUp() {
-  const client = await pool.connect();
+async function runUp(providedClient) {
+  const client = providedClient || (await pool.connect());
+  let lockAcquired = false;
   try {
+    await acquireMigrationLock(client);
+    lockAcquired = true;
     validateMigrationFiles();
     await ensureSchemaMigrationsTable(client);
     const appliedRows = await loadApplied(client);
-    const appliedMap = new Map(appliedRows.map((r) => [r.filename, r]));
+    const appliedMap = new Map(appliedRows.map(r => [r.filename, r]));
 
     // Verify that already-applied migrations haven't been edited in place.
     for (const file of listUpMigrationFilenames()) {
@@ -71,10 +76,10 @@ async function runUp() {
       try {
         await client.query('BEGIN');
         await client.query(sql);
-        await client.query(
-          'INSERT INTO schema_migrations (filename, file_hash) VALUES ($1, $2)',
-          [file, hash]
-        );
+        await client.query('INSERT INTO schema_migrations (filename, file_hash) VALUES ($1, $2)', [
+          file,
+          hash,
+        ]);
         await client.query('COMMIT');
         count++;
       } catch (err) {
@@ -93,12 +98,28 @@ async function runUp() {
       }
     }
     console.log(`[migrate] Done. Applied ${count} migration(s).`);
-  } catch (_err) {
+  } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    process.exitCode = 1;
+    // Never swallow the failure silently: an unexplained non-zero exit hides
+    // validation errors (e.g. an unsupported migration file) from operators.
+    console.error('[migrate] Failed:', err.message);
+    if (!providedClient) {
+      process.exitCode = 1;
+    } else {
+      throw err;
+    }
   } finally {
-    client.release();
-    await pool.end();
+    if (lockAcquired) {
+      try {
+        await releaseMigrationLock(client);
+      } catch (unlockErr) {
+        console.error('[migrate] Advisory unlock failed:', unlockErr.message);
+      }
+    }
+    if (!providedClient) {
+      client.release();
+      await pool.end();
+    }
   }
 }
 
@@ -107,10 +128,10 @@ async function runStatus() {
   try {
     await ensureSchemaMigrationsTable(client);
     const appliedRows = await loadApplied(client);
-    const appliedMap = new Map(appliedRows.map((r) => [r.filename, r]));
+    const appliedMap = new Map(appliedRows.map(r => [r.filename, r]));
 
     const files = listAllMigrationFilenames();
-    const rows = files.map((file) => {
+    const rows = files.map(file => {
       const record = appliedMap.get(file);
       let status = 'PENDING';
       let appliedAt = '';
@@ -119,9 +140,10 @@ async function runStatus() {
       } else if (file.endsWith('.down.sql')) {
         status = 'DOWN MIGRATION';
       } else if (record) {
-        appliedAt = record.applied_at instanceof Date
-          ? record.applied_at.toISOString()
-          : String(record.applied_at);
+        appliedAt =
+          record.applied_at instanceof Date
+            ? record.applied_at.toISOString()
+            : String(record.applied_at);
         status =
           record.file_hash && record.file_hash !== fileHashFor(file)
             ? 'APPLIED (HASH MISMATCH)'
@@ -136,11 +158,13 @@ async function runStatus() {
       const at = r.appliedAt ? ` @ ${r.appliedAt}` : '';
       console.log(`  ${r.status.padEnd(28)} ${r.file}${at}`);
     }
-    const pending = rows.filter((r) => r.status === 'PENDING').length;
-    const applied = rows.filter((r) => r.status.startsWith('APPLIED')).length;
-    const unsupported = rows.filter((r) => r.status === 'UNSUPPORTED FORMAT').length;
+    const pending = rows.filter(r => r.status === 'PENDING').length;
+    const applied = rows.filter(r => r.status.startsWith('APPLIED')).length;
+    const unsupported = rows.filter(r => r.status === 'UNSUPPORTED FORMAT').length;
     console.log('-----------------');
-    console.log(`${applied} applied, ${pending} pending, ${unsupported} unsupported (${rows.length} total).`);
+    console.log(
+      `${applied} applied, ${pending} pending, ${unsupported} unsupported (${rows.length} total).`
+    );
   } catch (err) {
     console.error('[migrate:status] Failed:', err.message);
     process.exitCode = 1;
@@ -171,10 +195,16 @@ async function main() {
       console.error(`Unknown command: ${COMMAND}`);
       console.error('Usage: node db/migrate.js [up|status|down] [--bootstrap-schema]');
       console.error('  --bootstrap-schema  skip migrations whose objects already exist after');
-      console.error('                      `psql -f db/schema.sql` (used by npm run migrate:fresh)');
+      console.error(
+        '                      `psql -f db/schema.sql` (used by npm run migrate:fresh)'
+      );
       process.exitCode = 1;
       await pool.end();
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { runUp, runStatus, runDown };

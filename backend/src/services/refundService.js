@@ -36,6 +36,7 @@ async function getCampaignRefunds(campaignId, { status = null, limit = 50, offse
 const db = require('../config/database');
 const logger = require('../config/logger');
 const stellarService = require('./stellarService');
+const withTransaction = require('../utils/withTransaction');
 
 async function getEligibleContributions(campaignId, options = {}) {
   const limit = Math.max(1, Math.min(500, parseInt(options.limit, 10) || 50));
@@ -68,55 +69,101 @@ async function listRefunds(campaignId, options = {}) {
 }
 
 async function processRefund(contributionId, amount, service = stellarService) {
+  let reason = null;
+  let initiatorId = null;
+  let isForceRefund = false;
+  let adminNote = null;
+  if (contributionId && typeof contributionId === 'object') {
+    const options = contributionId;
+    contributionId = options.contributionId;
+    amount = options.amount;
+    service = options.service || service;
+    reason = options.reason || null;
+    initiatorId = options.initiatorId || null;
+    isForceRefund = Boolean(options.isForceRefund);
+    adminNote = options.adminNote || null;
+  }
   const numericAmount = Number(amount);
   if (isNaN(numericAmount) || numericAmount <= 0) {
-    throw new Error('Invalid refund amount');
+    const error = new Error('Invalid refund amount');
+    error.status = 400;
+    throw error;
   }
 
-  const client = await db.pool.connect();
-  try {
-    await client.query('BEGIN');
-
+  const pool = typeof db.connect === 'function' ? db : db.pool;
+  return withTransaction(async client => {
     const { rows: contribRows } = await client.query(
-      `SELECT id, campaign_id, sender_public_key, amount, refunded_amount
-       FROM contributions
-       WHERE id = $1 FOR UPDATE`,
+      `SELECT id, campaign_id, sender_public_key, amount, refunded_amount,
+              c.wallet_public_key, c.creator_id
+       FROM contributions JOIN campaigns c ON c.id = contributions.campaign_id
+       WHERE contributions.id = $1 FOR UPDATE`,
       [contributionId]
     );
 
     if (!contribRows.length) {
-      throw new Error('Contribution not found');
+      const error = new Error('Contribution not found');
+      error.status = 404;
+      throw error;
     }
 
     const contrib = contribRows[0];
     const remaining = Number(contrib.amount) - Number(contrib.refunded_amount || 0);
 
     if (numericAmount > remaining) {
-      throw new Error('Refund amount exceeds remaining contribution balance');
+      const error = new Error('Refund amount exceeds remaining contribution balance');
+      error.status = 422;
+      throw error;
     }
 
     let txHash = null;
-    if (service && typeof service.sendCampaignRefund === 'function') {
-      const result = await service.sendCampaignRefund({
-        campaignId: contrib.campaign_id,
-        destinationKey: contrib.sender_public_key,
-        amount: numericAmount,
-      });
-      if (result && result.txHash) {
-        txHash = result.txHash;
+    try {
+      if (service && typeof service.sendCampaignRefund === 'function') {
+        const result = await service.sendCampaignRefund({
+          campaignId: contrib.campaign_id,
+          destinationKey: contrib.sender_public_key,
+          amount: numericAmount,
+        });
+        txHash = result?.txHash || result?.hash || null;
+      } else if (service && typeof service.submitDisputeRefund === 'function') {
+        const result = await service.submitDisputeRefund({
+          campaignWalletPublicKey: contrib.wallet_public_key,
+          creatorId: contrib.creator_id,
+          refunds: [{ walletPublicKey: contrib.sender_public_key, amount: numericAmount }],
+        });
+        txHash = result?.txHash || result?.hash || null;
       }
+    } catch (err) {
+      logger.error('On-chain refund transfer failed', {
+        contributionId,
+        campaignId: contrib.campaign_id,
+        error: err.message,
+      });
+      txHash = null;
     }
 
     if (!txHash) {
-      await client.query('ROLLBACK');
-      throw new Error('On-chain refund transaction failed or missing transaction hash');
+      const error = new Error('On-chain refund transaction failed or missing transaction hash');
+      error.status = 502;
+      throw error;
     }
 
     const { rows: refundRows } = await client.query(
-      `INSERT INTO refunds (campaign_id, contribution_id, amount, status, tx_hash, created_at)
-       VALUES ($1, $2, $3, 'completed', $4, NOW())
-       RETURNING id, campaign_id, contribution_id, amount, status, tx_hash, created_at`,
-      [contrib.campaign_id, contributionId, numericAmount, txHash]
+      `INSERT INTO creator_refunds
+         (campaign_id, contribution_id, recipient_wallet, amount, asset, reason, status,
+          tx_hash, stellar_tx_hash, is_force_refund, admin_note, created_by, processed_at)
+       VALUES ($1, $2, $3, $4, 'native', $5, 'completed', $6, $6, $7, $8, $9, NOW())
+       RETURNING id, campaign_id, contribution_id, amount, status, tx_hash, is_force_refund, admin_note, created_at`,
+      [
+        contrib.campaign_id,
+        contributionId,
+        contrib.sender_public_key,
+        numericAmount,
+        reason,
+        txHash,
+        isForceRefund,
+        adminNote,
+        initiatorId,
+      ]
     );
 
     await client.query(
@@ -134,14 +181,8 @@ async function processRefund(contributionId, amount, service = stellarService) {
       [numericAmount, contrib.campaign_id]
     );
 
-    await client.query('COMMIT');
     return refundRows[0];
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    client.release();
-  }
+  }, pool);
 }
 
 module.exports = {
